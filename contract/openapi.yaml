@@ -1,0 +1,822 @@
+openapi: 3.1.0
+
+info:
+  title: ApiDMK v2
+  version: 1.0.0
+  description: |
+    API única del sistema de Guías de Remisión Electrónicas.
+
+    ## Topología
+    Se instala **on-premise en el servidor de cada cliente**, junto a su SQL Server
+    (DataMart del ERP DMK/POSM). Es el **único** componente autorizado a abrir
+    conexiones contra ese SQL Server.
+
+        Laravel  ──HTTP──>  ApiDMK v2  ──JDBC──>  SQL Server local (SPs)
+                                │
+                                └──HTTPS──>  GestionDbFact (central, SUNAT)
+
+    ## Reglas de diseño
+    1. **Laravel nunca abre conexión a SQL Server.** Todo pasa por aquí.
+    2. **Los precios viajan SIEMPRE sin IGV.** La tasa es configuración del
+       servidor (`dmk.igv.tasa`), no una constante repetida en PHP/JS/Blade/SP.
+    3. **`esConsignado` es un campo del detalle de la guía**, no un UPDATE aparte.
+       Esto elimina el canal directo Laravel→SQL Server y el problema de orden
+       entre el UPDATE y el stored procedure.
+    4. **Errores normalizados** (RFC 7807). Se elimina el envoltorio `{exito,msgerror}`.
+    5. **`POST /guias` es idempotente** vía `Idempotency-Key`.
+
+servers:
+  - url: http://localhost:8181/api/v1
+    description: Instalación on-premise (servidor del cliente)
+
+security:
+  - apiKey: []
+
+tags:
+  - name: Catálogos
+    description: Datos maestros del DataMart (solo lectura)
+  - name: Búsquedas
+    description: Consultas paramétricas sobre maestros
+  - name: Guías
+    description: Registro y anulación de guías en el DataMart
+  - name: SUNAT
+    description: Fachada hacia GestionDbFact (facturación electrónica central)
+  - name: Sistema
+    description: Salud e introspección de capacidades
+
+paths:
+
+  # ─────────────────────────── Sistema ───────────────────────────
+  /health:
+    get:
+      tags: [Sistema]
+      summary: Estado del servicio y sus dependencias
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /capabilities:
+    get:
+      tags: [Sistema]
+      summary: Qué soporta ESTA instalación
+      description: |
+        Permite que Laravel se adapte al cliente sin condicionales por cliente
+        en el código. Reemplaza al flag `CONSIGNADOS_ENABLED` del `.env`:
+        la API sabe si el DataMart tiene las columnas y lo declara aquí.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capabilities' }
+
+  # ─────────────────────────── Catálogos ───────────────────────────
+  /almacenes:
+    get:
+      tags: [Catálogos]
+      summary: Almacenes activos
+      description: 'SP: GetMaestroalmacenByEstado'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Almacen' }
+
+  /operaciones:
+    get:
+      tags: [Catálogos]
+      summary: Tipos de operación (motivos de traslado SUNAT)
+      description: 'SP: GetMaestroOperacionByEstado'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Operacion' }
+
+  /formas-pago:
+    get:
+      tags: [Catálogos]
+      summary: Formas de pago
+      description: 'SP: GetMaestroformadepagoAll'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FormaPago' }
+
+  /listas-precio:
+    get:
+      tags: [Catálogos]
+      summary: Listas de precio por sucursal
+      description: 'SP: GetSucursalPrecio'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ListaPrecio' }
+
+  /series-guia:
+    get:
+      tags: [Catálogos]
+      summary: Series y último correlativo de guías
+      description: 'SP: GetMaestrodocumentoserieByTipodocumento'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SerieNumero' }
+
+  /trabajadores:
+    get:
+      tags: [Catálogos]
+      summary: Trabajadores / vendedores
+      description: 'SP: GetMaestrotrabajadorByCodtrabajador'
+      parameters:
+        - name: codTrabajador
+          in: query
+          schema: { type: integer, default: -1 }
+          description: '-1 devuelve todos'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Trabajador' }
+
+  /tipo-cambio:
+    get:
+      tags: [Catálogos]
+      summary: Tipo de cambio por rango de fechas
+      description: 'SP: GetMaestrotipocambioByFechatipocambio'
+      parameters:
+        - { name: fechaInicio, in: query, required: true, schema: { type: string, format: date } }
+        - { name: fechaFin,    in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TipoCambio' }
+
+  # ─────────────────────────── Búsquedas ───────────────────────────
+  /articulos/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar artículos con stock y precio
+      description: |
+        SP: `GetMultiAlmacenGuiaIngMaestroarticuloByCodarticulo`.
+
+        **Unifica el fork `_ApiDMK`.** Hoy existen dos versiones del mismo SP
+        con contratos distintos; el instalador deja una sola que devuelve
+        siempre `peso`, `tipoIgv`, `codUnece` y `descUnidadMedida`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BuscarArticuloRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Articulo' }
+
+  /clientes/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar clientes
+      description: 'SP: GetDatosClientexTipo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusquedaPorTipo' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Cliente' } }
+
+  /proveedores/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar proveedores
+      description: 'SPs: GetMaestroproveedoresByRuc / ByCodproveedor / pr_consultaProveedorlikeRazonsocial'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusquedaPorTipo' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Proveedor' } }
+
+  /transportistas/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar transportistas
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusquedaPorTipo' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Transportista' } }
+
+  /vehiculos/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar vehículos
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusquedaPorTipo' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Vehiculo' } }
+
+  /choferes/buscar:
+    post:
+      tags: [Búsquedas]
+      summary: Buscar choferes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nombreChofer: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Chofer' } }
+
+  /ubigeos:
+    post:
+      tags: [Búsquedas]
+      summary: Ubigeos en cascada (departamento → provincia → distrito)
+      description: 'SP: pr_ObtieneUbigeo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tipoConsulta]
+              properties:
+                tipoConsulta:
+                  type: integer
+                  enum: [1, 2, 3]
+                  description: '1=departamento, 2=provincia, 3=distrito'
+                codigoUbigeo:
+                  type: string
+                  description: 'Código padre. Vacío para nivel 1.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Ubigeo' } }
+
+  # ─────────────────────────── Guías ───────────────────────────
+  /guias:
+    post:
+      tags: [Guías]
+      summary: Registrar una guía en el DataMart
+      description: |
+        SP: `prc_InsertGuiaDMKWeb` → `InsertarGuiasOdooDmk`.
+
+        **Cambios respecto de InsertGuiaDMK v1:**
+        - `esConsignado` viaja en cada línea del detalle. La API lo persiste en
+          `DetalleGuiaRemision.esconsignado` y reconcilia `MaestroArticulo.consignacion`.
+          Laravel ya no hace UPDATEs directos.
+        - `tipoIgv` y `descuento` viajan en el detalle (el SP ya los lee del XML;
+          el DTO v1 no los enviaba).
+        - Los importes van **sin IGV**. La API aplica la tasa configurada.
+        - Artículos que no existen en `MaestroArticulo` se reportan en
+          `lineasRechazadas` en vez de descartarse en silencio por el INNER JOIN.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+          description: |
+            Reintentar con la misma clave devuelve el resultado original sin
+            reinsertar. Resuelve la duplicación de detalle que ocurre cuando
+            `CodProveedor` llega nulo y el dedupe del SP no hace match.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GuiaRequest' }
+      responses:
+        '201':
+          description: Guía registrada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuiaResponse' }
+        '200':
+          description: Ya registrada previamente con esta Idempotency-Key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuiaResponse' }
+        '409':
+          description: La guía ya existe en el DataMart con otra clave
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: Validación fallida
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /guias/{anio}/{tipoGuia}/{serie}/{numero}:
+    parameters:
+      - { name: anio,     in: path, required: true, schema: { type: integer } }
+      - { name: tipoGuia, in: path, required: true, schema: { type: string, enum: [N, A] } }
+      - { name: serie,    in: path, required: true, schema: { type: string } }
+      - { name: numero,   in: path, required: true, schema: { type: integer } }
+
+    get:
+      tags: [Guías]
+      summary: Consultar una guía registrada
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuiaResponse' }
+        '404':
+          description: No existe
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+    delete:
+      tags: [Guías]
+      summary: Anular una guía en el DataMart
+      description: |
+        SPs: `proc_anulaGuiaDMK` / `proc_eliminaGuiaDMK`.
+
+        **Existen en SQL Server pero el WAR actual no los expone**, por eso hoy
+        `EliminaGuiaDMK` responde 404 desde Laravel.
+      responses:
+        '204': { description: Anulada }
+        '404':
+          description: No existe
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ─────────────────────────── SUNAT (fachada) ───────────────────────────
+  /guias/{anio}/{tipoGuia}/{serie}/{numero}/sunat:
+    parameters:
+      - { name: anio,     in: path, required: true, schema: { type: integer } }
+      - { name: tipoGuia, in: path, required: true, schema: { type: string, enum: [N, A] } }
+      - { name: serie,    in: path, required: true, schema: { type: string } }
+      - { name: numero,   in: path, required: true, schema: { type: integer } }
+
+    post:
+      tags: [SUNAT]
+      summary: Emitir la guía ante SUNAT
+      description: |
+        Fachada hacia `GestionDbFact PUT /api/Guia21` (servicio central).
+
+        **La `credencial` del facturador es configuración del servidor**
+        (`dmk.facturacion.credencial`), no un parámetro que Laravel conozca ni
+        envíe. Con esto Laravel deja de manejar secretos del PSE.
+      responses:
+        '202':
+          description: Aceptada, pendiente de respuesta de SUNAT
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EstadoSunat' }
+        '422':
+          description: Rechazada por el facturador
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: El facturador central no respondió
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+    get:
+      tags: [SUNAT]
+      summary: Consultar estado en SUNAT
+      description: 'Fachada hacia ConsultaEstadoGRE.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EstadoSunat' }
+
+  /guias/{anio}/{tipoGuia}/{serie}/{numero}/pdf:
+    parameters:
+      - { name: anio,     in: path, required: true, schema: { type: integer } }
+      - { name: tipoGuia, in: path, required: true, schema: { type: string, enum: [N, A] } }
+      - { name: serie,    in: path, required: true, schema: { type: string } }
+      - { name: numero,   in: path, required: true, schema: { type: integer } }
+    get:
+      tags: [SUNAT]
+      summary: Descargar el PDF del comprobante
+      responses:
+        '200':
+          description: OK
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+
+  /guias/{anio}/{tipoGuia}/{serie}/{numero}/xml:
+    parameters:
+      - { name: anio,     in: path, required: true, schema: { type: integer } }
+      - { name: tipoGuia, in: path, required: true, schema: { type: string, enum: [N, A] } }
+      - { name: serie,    in: path, required: true, schema: { type: string } }
+      - { name: numero,   in: path, required: true, schema: { type: integer } }
+    get:
+      tags: [SUNAT]
+      summary: Descargar el XML firmado
+      responses:
+        '200':
+          description: OK
+          content:
+            application/xml:
+              schema: { type: string, format: binary }
+
+components:
+
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: |
+        Clave compartida entre Laravel y ApiDMK, ambos en la red del cliente.
+        **Hoy la API no tiene ninguna autenticación**: cualquiera con acceso al
+        puerto 8181 puede insertar guías. Esto lo corrige.
+
+  schemas:
+
+    # ─── Sistema ───
+    Health:
+      type: object
+      properties:
+        status:    { type: string, enum: [UP, DEGRADED, DOWN] }
+        version:   { type: string, example: '2.0.0' }
+        sqlServer: { type: string, enum: [UP, DOWN] }
+        facturacion:
+          type: string
+          enum: [UP, DOWN, NOT_CONFIGURED]
+        datamartSchema:
+          type: string
+          description: Versión de migración aplicada al DataMart
+          example: '2026.09.03'
+
+    Capabilities:
+      type: object
+      description: |
+        Lo que esta instalación soporta. Laravel lo consulta al arrancar y
+        adapta la UI: sin condicionales por cliente en el código.
+      properties:
+        consignados:
+          type: boolean
+          description: '`MaestroArticulo.consignacion` y `DetalleGuiaRemision.esconsignado` presentes'
+        facturacionElectronica:
+          type: boolean
+        anulacionGuias:
+          type: boolean
+          description: '`proc_anulaGuiaDMK` instalado'
+        multiAlmacen:
+          type: boolean
+        igv:
+          type: object
+          properties:
+            tasa:    { type: number, example: 0.18 }
+            vigente: { type: string, format: date }
+          description: |
+            **Única fuente de verdad del IGV.** Hoy el 18% está cableado en 14
+            lugares: PHP, JS, Blade y el propio stored procedure.
+
+    Problem:
+      type: object
+      description: RFC 7807. Reemplaza al envoltorio `{exito:false, msgerror:"..."}`.
+      properties:
+        type:     { type: string, format: uri, example: 'https://dbperu.com/errors/articulo-no-existe' }
+        title:    { type: string, example: 'Artículo no encontrado en MaestroArticulo' }
+        status:   { type: integer, example: 422 }
+        detail:   { type: string }
+        instance: { type: string }
+        errores:
+          type: array
+          items:
+            type: object
+            properties:
+              campo:   { type: string }
+              mensaje: { type: string }
+
+    # ─── Catálogos ───
+    Almacen:
+      type: object
+      properties:
+        codAlmacen:  { type: integer }
+        descripcion: { type: string }
+        codInterno:  { type: string, description: 'Código anexo SUNAT' }
+        direccion:   { type: string, nullable: true }
+        ubigeo:      { type: string, nullable: true }
+        codEstacion: { type: integer }
+
+    Operacion:
+      type: object
+      properties:
+        tipoOperacion:       { type: integer }
+        descripcion:         { type: string }
+        ingresoSalida:       { type: string, enum: [Ingreso, Salida] }
+        motivoTraslado:      { type: string, description: 'Catálogo 20 SUNAT' }
+        descriMotivoTraslado: { type: string }
+
+    FormaPago:
+      type: object
+      properties:
+        codFormaPago: { type: integer }
+        descripcion:  { type: string }
+
+    ListaPrecio:
+      type: object
+      properties:
+        codListaPrecio: { type: integer }
+        precio:         { type: string }
+        codEstacion:    { type: integer }
+
+    SerieNumero:
+      type: object
+      properties:
+        numSerie:          { type: string }
+        ultimoValorMarket: { type: integer }
+        tipoDocumento:     { type: integer }
+
+    Trabajador:
+      type: object
+      properties:
+        codTrabajador: { type: integer }
+        nombres:       { type: string }
+        apellidos:     { type: string }
+        dni:           { type: string, nullable: true }
+        cargo:         { type: string, nullable: true }
+
+    TipoCambio:
+      type: object
+      properties:
+        fecha:  { type: string, format: date }
+        compra: { type: number }
+        venta:  { type: number }
+
+    # ─── Búsquedas ───
+    BusquedaPorTipo:
+      type: object
+      required: [tipo, valor]
+      properties:
+        tipo:  { type: integer, description: 'Criterio: 1=código, 2=RUC/DNI, 3=razón social, 4=placa' }
+        valor: { type: string }
+
+    BuscarArticuloRequest:
+      type: object
+      required: [tipoConsulta, valor, codAlmacen]
+      properties:
+        tipoConsulta:   { type: integer, enum: [1, 2], description: '1=código de barras, 2=código de artículo/nombre' }
+        valor:          { type: string }
+        codEstacion:    { type: integer }
+        codAlmacen:     { type: integer }
+        codListaPrecio: { type: integer, default: 1 }
+
+    Articulo:
+      type: object
+      description: |
+        Campos marcados NUEVO no los devuelve el WAR actual, pero Laravel ya los
+        consume (con `?? 0` de fallback, por eso `tipoIgv` siempre llega 0).
+      properties:
+        codArticulo:      { type: integer }
+        codBarra:         { type: string }
+        codPlu:           { type: string, nullable: true, description: 'NUEVO' }
+        nombreArticulo:   { type: string }
+        precioSinIgv:     { type: number, description: 'Base de cálculo. Siempre SIN IGV.' }
+        costoArticulo:    { type: number, description: 'Costo unitario, sin IGV' }
+        tipoIgv:
+          type: integer
+          description: 'NUEVO. 1=gravado, otro=inafecto/exonerado'
+        afectoIgv:        { type: boolean, description: 'NUEVO. Derivado de tipoIgv, para no repetir la regla en el cliente' }
+        stock:            { type: number }
+        peso:             { type: number, description: 'NUEVO' }
+        codUnidad:        { type: integer }
+        descUnidadMedida: { type: string, description: 'NUEVO' }
+        codUnece:         { type: string, description: 'NUEVO. Unidad SUNAT (antes siglaUMFE)' }
+        consignado:       { type: boolean, description: 'NUEVO. Solo si capabilities.consignados = true' }
+        marca:            { type: string, nullable: true }
+
+    Cliente:
+      type: object
+      properties:
+        codCliente:              { type: integer }
+        razonSocial:             { type: string }
+        numeroDocumento:         { type: string }
+        tipoDocumentoIdentidad:  { type: string }
+        direccion:               { type: string, nullable: true }
+        ubigeo:                  { type: string, nullable: true }
+
+    Proveedor:
+      type: object
+      properties:
+        codProveedor:    { type: integer }
+        nombreProveedor: { type: string }
+        ruc:             { type: string }
+        direccion:       { type: string, nullable: true }
+
+    Transportista:
+      type: object
+      properties:
+        codTransportista:    { type: integer }
+        nombreTransportista: { type: string }
+        rucTransportista:    { type: string }
+        direccion:           { type: string, nullable: true }
+
+    Vehiculo:
+      type: object
+      properties:
+        placaVehiculo:  { type: string }
+        marcaVehiculo:  { type: string, nullable: true }
+
+    Chofer:
+      type: object
+      properties:
+        nombreChofer:  { type: string }
+        dni:           { type: string }
+        breveteChofer: { type: string, nullable: true }
+
+    Ubigeo:
+      type: object
+      properties:
+        codUbigeo:   { type: string }
+        descripcion: { type: string }
+
+    # ─── Guías ───
+    GuiaRequest:
+      type: object
+      required: [anio, tipoGuia, serie, numero, fechaEmision, codEstacion, tipoOperacion, detalle]
+      properties:
+        anio:              { type: integer }
+        tipoGuia:          { type: string, enum: [N, A], description: 'N=ingreso, A=salida' }
+        serie:             { type: string }
+        numero:            { type: integer }
+        fechaEmision:      { type: string, format: date }
+        fechaInicioTraslado:
+          type: string
+          format: date
+          nullable: true
+          description: 'Si es null, la API usa fechaEmision. Antes el fallback vivía en Laravel.'
+
+        codEstacion:       { type: integer }
+        codAlmacen:        { type: integer }
+        codAlmacenOrigen:  { type: integer, nullable: true }
+        codAlmacenDestino: { type: integer, nullable: true }
+        codListaPrecio:    { type: integer, nullable: true }
+        tipoOperacion:     { type: integer }
+        codTrabajador:     { type: integer }
+        codProveedor:      { type: integer, nullable: true }
+        codCliente:        { type: integer, nullable: true }
+        formaPago:         { type: integer, nullable: true }
+        tipoMoneda:        { type: integer, default: 1, description: '1=soles, 2=dólares' }
+        comentario:        { type: string, nullable: true }
+        descuento:         { type: number, default: 0 }
+
+        traslado:
+          $ref: '#/components/schemas/DatosTraslado'
+
+        detalle:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/GuiaDetalle' }
+
+      description: |
+        **No se envían `valorVenta`, `igv` ni `totalVenta`.** La API los calcula
+        desde el detalle con la tasa configurada y los devuelve en la respuesta.
+        Hoy Laravel los calcula, el JS los recalcula y el SP los vuelve a tocar:
+        tres fuentes de verdad para el mismo número.
+
+    DatosTraslado:
+      type: object
+      description: Solo aplica a guías de salida (tipoGuia = A)
+      properties:
+        modalidadTransporte: { type: string, default: '18', description: 'Catálogo 18 SUNAT. Antes cableado en 3 sitios.' }
+        direccionPartida:    { type: string, nullable: true }
+        ubigeoPartida:       { type: string, nullable: true }
+        direccionLlegada:    { type: string, nullable: true }
+        ubigeoLlegada:       { type: string, nullable: true }
+        placaVehiculo:       { type: string, nullable: true }
+        nombreChofer:        { type: string, nullable: true }
+        dniChofer:           { type: string, nullable: true }
+        breveteChofer:       { type: string, nullable: true }
+        rucTransportista:    { type: string, nullable: true }
+        nombreTransportista: { type: string, nullable: true }
+
+    GuiaDetalle:
+      type: object
+      required: [item, codArticulo, cantidad, precioSinIgv, unidadMedida]
+      properties:
+        item:         { type: integer, description: 'Correlativo real. El v1 mandaba 1 en todas las líneas.' }
+        codArticulo:  { type: integer }
+        cantidad:     { type: number }
+        precioSinIgv: { type: number, description: 'Precio unitario SIN IGV' }
+        unidadMedida: { type: integer }
+        descuento:    { type: number, default: 0, description: 'Monto, no porcentaje' }
+        tipoIgv:      { type: integer, description: '1=gravado. Si se omite, se toma de MaestroArticulo.' }
+        esConsignado:
+          type: boolean
+          default: false
+          description: |
+            **El cambio central.** Antes Laravel hacía
+            `UPDATE MaestroArticulo SET consignacion` por conexión directa,
+            antes o después del SP según el controller, y luego parchaba
+            `DetalleGuiaRemision`. Ahora viaja aquí y la API lo resuelve en la
+            misma transacción del insert.
+
+    GuiaResponse:
+      type: object
+      properties:
+        anio:        { type: integer }
+        tipoGuia:    { type: string }
+        serie:       { type: string }
+        numero:      { type: integer }
+        estado:      { type: string, enum: [REGISTRADA, ANULADA] }
+        valorVenta:  { type: number, description: 'Calculado por la API' }
+        igv:         { type: number }
+        totalVenta:  { type: number }
+        tasaIgvAplicada: { type: number, example: 0.18 }
+        consignadosMarcados:
+          type: integer
+          description: 'Filas de MaestroArticulo efectivamente actualizadas'
+        lineasRechazadas:
+          type: array
+          description: |
+            Artículos que no existen en `MaestroArticulo`. Hoy el
+            `INNER JOIN MaestroArticulo` del SP los descarta **en silencio**:
+            ésa es la causa real del "de 20 solo entraron 15".
+          items:
+            type: object
+            properties:
+              item:        { type: integer }
+              codArticulo: { type: integer }
+              motivo:      { type: string, example: 'No existe en MaestroArticulo' }
+
+    EstadoSunat:
+      type: object
+      properties:
+        estado:
+          type: string
+          enum: [PENDIENTE, ACEPTADA, RECHAZADA, OBSERVADA]
+          description: 'Normalizado. El PSE devuelve A/B/O y hoy Laravel los mapea a ids locales.'
+        codigoSunat: { type: string, nullable: true }
+        mensaje:     { type: string, nullable: true }
+        ticket:      { type: string, nullable: true }
+        hashCpe:     { type: string, nullable: true }

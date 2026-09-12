@@ -1,0 +1,57 @@
+<!--
+  WinSW · convierte ApiDMK.jar en un SERVICIO DE WINDOWS
+  ==========================================================================
+  Resuelve "que se inicie de forma perpetua, así se apague el servidor":
+    · arranca solo al encender la máquina, SIN que nadie inicie sesión
+    · si el proceso muere, Windows lo reinicia solo
+    · espera a que SQL Server esté arriba antes de arrancar
+
+  INSTALACIÓN (una vez, como Administrador):
+      WinSW.NET4.exe  ->  renombrar a  apidmk-service.exe
+      apidmk-service.exe install
+      apidmk-service.exe start
+
+  Comprobar:   sc query DBPeruApiDMK
+  Actualizar:  apidmk-service.exe stop  ->  reemplazar ApiDMK.jar  ->  start
+  Desinstalar: apidmk-service.exe uninstall
+
+  WinSW v2 corre sobre .NET Framework 4.0 → compatible con Windows 7.
+-->
+<service>
+  <id>DBPeruApiDMK</id>
+  <name>DBPeru ApiDMK v2</name>
+  <description>API de Guias de Remision. Unico componente que habla con SQL Server.</description>
+
+  <!-- JRE 8 empaquetado junto al servicio: no depende del Java del cliente -->
+  <executable>%BASE%\jre8\bin\java.exe</executable>
+
+  <arguments>
+    -Xms128m -Xmx512m
+    -Dfile.encoding=UTF-8
+    -Dspring.config.location=file:%BASE%\config\application.properties
+    -jar %BASE%\ApiDMK.jar
+  </arguments>
+
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <!-- Arranca al encender la maquina, sin sesion iniciada -->
+  <startmode>Automatic</startmode>
+
+  <!-- No arrancar antes que SQL Server. Ajustar el nombre si es instancia nombrada:
+       MSSQLSERVER (default) | MSSQL$NOMBREINSTANCIA -->
+  <depend>MSSQLSERVER</depend>
+
+  <!-- Si el proceso muere, reintentar. Si sigue muriendo, esperar mas. -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="120 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Log rotativo, para no llenar el disco del cliente -->
+  <logpath>%BASE%\logs</logpath>
+  <logmode>roll-by-size-time</logmode>
+  <sizeThreshold>10240</sizeThreshold>
+  <keepFiles>14</keepFiles>
+
+  <stoptimeout>30 sec</stoptimeout>
+</service>

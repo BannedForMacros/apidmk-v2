@@ -1,0 +1,9 @@
+# Configuracion con credenciales reales del cliente. No se versiona: este
+# repositorio es publico. La plantilla sin claves es application.properties.ejemplo
+apidmk-v1-src/application.properties
+
+# Compilados y basura del sistema
+target/
+*.class
+*.jar
+.DS_Store
